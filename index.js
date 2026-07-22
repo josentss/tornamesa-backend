@@ -4,73 +4,133 @@ const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(cors());
-app.use(express.json()); // Vital para poder recibir datos en formato JSON en los POST
 
-// Inicializar Supabase
+// 🔒 MIDDLEWARE
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3001',
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  credentials: true
+}));
+
+app.use(express.json({ limit: '10kb' }));
+
+// 🔧 INICIALIZACIÓN SUPABASE
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 
+// 📡 MANEJO DE TOKEN SPOTIFY CON CACHE
 let spotifyToken = '';
 let tokenExpiry = 0;
 
-// Función para obtener/renovar token de Spotify
 async function getSpotifyToken() {
-  const ahora = Date.now();
-  if (spotifyToken && ahora < tokenExpiry) return spotifyToken;
+  const now = Date.now();
+  if (spotifyToken && now < tokenExpiry) return spotifyToken;
 
-  const credentials = btoa(`${process.env.SPOTIFY_CLIENT_ID}:${process.env.SPOTIFY_CLIENT_SECRET}`);
-  const response = await fetch('https://accounts.spotify.com/api/token', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Basic ${credentials}`,
-      'Content-Type': 'application/x-www-form-urlencoded'
-    },
-    body: 'grant_type=client_credentials'
-  });
+  try {
+    const credentials = Buffer.from(`${process.env.SPOTIFY_CLIENT_ID}:${process.env.SPOTIFY_CLIENT_SECRET}`).toString('base64');
 
-  const data = await response.json();
-  spotifyToken = data.access_token;
-  tokenExpiry = ahora + (data.expires_in - 10) * 1000;
-  console.log('🔄 Token de Spotify renovado con éxito');
-  return spotifyToken;
+    const response = await fetch('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${credentials}`,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: 'grant_type=client_credentials'
+    });
+
+    if (!response.ok) throw new Error('Spotify token request failed');
+
+    const data = await response.json();
+    spotifyToken = data.access_token;
+    tokenExpiry = now + (data.expires_in - 60) * 1000; // Renovar 60s antes
+    console.log('✅ Token Spotify renovado');
+    return spotifyToken;
+  } catch (error) {
+    console.error('❌ Error obteniendo token Spotify:', error.message);
+    throw new Error('No se pudo obtener token de Spotify');
+  }
 }
 
-// 1. RUTA DE BÚSQUEDA
+// 🛡️ FUNCIONES DE VALIDACIÓN
+function validateEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function validateUsername(username) {
+  return /^[a-zA-Z0-9_-]{3,20}$/.test(username);
+}
+
+function sanitizeString(str) {
+  return str?.trim().substring(0, 500) || '';
+}
+
+// ⚠️ MIDDLEWARE DE ERRORES
+function handleError(res, error, statusCode = 500) {
+  console.error('Error:', error.message);
+  res.status(statusCode).json({
+    error: error.message || 'Error interno del servidor'
+  });
+}
+
+// ==================== ENDPOINTS API ====================
+
+// 1️⃣ BÚSQUEDA DE ÁLBUMES
 app.get('/api/search', async (req, res) => {
   const { q } = req.query;
-  if (!q) return res.status(400).json({ error: 'Falta el parámetro de búsqueda' });
+
+  if (!q || q.trim().length < 2) {
+    return res.status(400).json({ error: 'Búsqueda debe tener al menos 2 caracteres' });
+  }
 
   try {
     const token = await getSpotifyToken();
-    const response = await fetch(`https://api.spotify.com/v1/search?q=${encodeURIComponent(q)}&type=album&limit=6`, {
-      headers: { 'Authorization': `Bearer ${token}` }
-    });
-    const data = await response.json();
+    const response = await fetch(
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(q)}&type=album&limit=10`,
+      { headers: { 'Authorization': `Bearer ${token}` } }
+    );
 
+    if (!response.ok) throw new Error('Error en búsqueda de Spotify');
+
+    const data = await response.json();
     const albums = data.albums.items.map(album => ({
       id: album.id,
       title: album.name,
-      artist: album.artists[0].name,
-      coverUrl: album.images[0]?.url,
+      artist: album.artists[0]?.name || 'Unknown',
+      coverUrl: album.images[0]?.url || null,
       releaseDate: album.release_date,
       spotifyLink: album.external_urls.spotify
     }));
 
     res.json(albums);
   } catch (error) {
-    res.status(500).json({ error: 'Error al conectar con Spotify' });
+    handleError(res, error, 500);
   }
 });
 
-// 2. NUEVA RUTA: REGISTRAR UNA ESCUCHA
+// 2️⃣ REGISTRAR ESCUCHA
 app.post('/api/listen', async (req, res) => {
   const { albumId, userId, rating, review } = req.body;
 
+  // Validaciones
   if (!albumId || !userId) {
-    return res.status(400).json({ error: 'Faltan campos obligatorios: albumId o userId' });
+    return res.status(400).json({ error: 'Faltan albumId o userId' });
+  }
+  if (rating && (rating < 1 || rating > 5)) {
+    return res.status(400).json({ error: 'Rating debe estar entre 1 y 5' });
   }
 
   try {
+    // Verificar si usuario existe
+    const { data: userData } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('id', userId)
+      .single();
+
+    if (!userData) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    // Buscar álbum en caché
     const { data: existingAlbum } = await supabase
       .from('albums')
       .select('spotify_id')
@@ -78,56 +138,60 @@ app.post('/api/listen', async (req, res) => {
       .single();
 
     if (!existingAlbum) {
+      // Obtener datos de Spotify y guardar
       const token = await getSpotifyToken();
       const spotifyResponse = await fetch(`https://api.spotify.com/v1/albums/${albumId}`, {
         headers: { 'Authorization': `Bearer ${token}` }
       });
 
-      if (!spotifyResponse.ok) throw new Error('Álbum no encontrado en Spotify');
+      if (!spotifyResponse.ok) {
+        return res.status(404).json({ error: 'Álbum no encontrado en Spotify' });
+      }
+
       const albumData = await spotifyResponse.json();
+      const totalDuration = albumData.tracks.items.reduce((acc, track) => acc + track.duration_ms, 0);
 
-      const totalDurationMs = albumData.tracks.items.reduce((acc, track) => acc + track.duration_ms, 0);
+      await supabase.from('albums').insert([{
+        spotify_id: albumData.id,
+        title: albumData.name,
+        artist: albumData.artists[0]?.name || 'Unknown',
+        cover_url: albumData.images[0]?.url || null,
+        duration_ms: totalDuration
+      }]);
 
-      const { error: albumError } = await supabase
-        .from('albums')
-        .insert([{
-          spotify_id: albumData.id,
-          title: albumData.name,
-          artist: albumData.artists[0].name,
-          cover_url: albumData.images[0]?.url,
-          duration_ms: totalDurationMs
-        }]);
-
-      if (albumError) throw albumError;
-      console.log(`💾 Nuevo álbum guardado en caché: ${albumData.name}`);
+      console.log(`💾 Álbum guardado: ${albumData.name}`);
     }
 
+    // Registrar escucha
     const { data: newListen, error: listenError } = await supabase
       .from('listens')
       .insert([{
         user_id: userId,
         album_id: albumId,
         rating: rating || null,
-        review: review || null
+        review: sanitizeString(review)
       }])
       .select();
 
     if (listenError) throw listenError;
 
-    res.status(201).json({ success: true, message: 'Escucha registrada con éxito en tornamesa', data: newListen });
-
+    res.status(201).json({
+      success: true,
+      message: 'Escucha registrada',
+      data: newListen[0]
+    });
   } catch (error) {
-    console.error('❌ Error en /api/listen:', error.message);
-    res.status(500).json({ error: 'Error interno al procesar el registro' });
+    handleError(res, error);
   }
 });
 
-// 3. OBTENER HISTORIAL Y ESTADÍSTICAS DEL USUARIO
+// 3️⃣ OBTENER HISTORIAL DEL USUARIO
 app.get('/api/users/:userId/history', async (req, res) => {
   const { userId } = req.params;
+  const { limit = 50, offset = 0 } = req.query;
 
   try {
-    const { data: history, error: historyError } = await supabase
+    const { data: history, error } = await supabase
       .from('listens')
       .select(`
         id,
@@ -143,61 +207,181 @@ app.get('/api/users/:userId/history', async (req, res) => {
         )
       `)
       .eq('user_id', userId)
-      .order('listened_at', { ascending: false });
+      .order('listened_at', { ascending: false })
+      .range(offset, offset + limit - 1);
 
-    if (historyError) throw historyError;
+    if (error) throw error;
 
-    const totalListens = history.length;
-    const totalMs = history.reduce((acc, item) => acc + (item.albums?.duration_ms || 0), 0);
-    const totalMinutes = Math.round(totalMs / 1000 / 60);
+    const totalMinutes = history.reduce((acc, item) =>
+      acc + (item.albums?.duration_ms || 0), 0
+    ) / 1000 / 60;
 
     res.json({
       stats: {
-        totalAlbumsListened: totalListens,
-        totalMinutesSpended: totalMinutes
+        totalAlbumsListened: history.length,
+        totalMinutesSpended: Math.round(totalMinutes)
       },
-      history: history
+      history: history || []
     });
-
   } catch (error) {
-    console.error('❌ Error en /api/users/:userId/history:', error.message);
-    res.status(500).json({ error: 'Error al obtener el historial' });
+    handleError(res, error);
   }
 });
 
-// 4. GENERAR EL RESUMEN MENSUAL DEL USUARIO
+// 4️⃣ OBTENER PERFIL PÚBLICO DEL USUARIO
+app.get('/api/profiles/username/:username', async (req, res) => {
+  const { username } = req.params;
+
+  try {
+    const { data: profile, error } = await supabase
+      .from('profiles')
+      .select('id, username, bio, created_at')
+      .ilike('username', `${username}%`)
+      .single();
+
+    if (error) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    // Obtener estadísticas del usuario
+    const { data: listens } = await supabase
+      .from('listens')
+      .select('rating, albums(duration_ms)')
+      .eq('user_id', profile.id);
+
+    const ratings = listens
+      .filter(l => l.rating)
+      .map(l => l.rating);
+
+    const totalMinutes = listens.reduce((acc, l) =>
+      acc + (l.albums?.duration_ms || 0), 0
+    ) / 1000 / 60;
+
+    const ratingsDistribution = {
+      '5': ratings.filter(r => r === 5).length,
+      '4': ratings.filter(r => r === 4).length,
+      '3': ratings.filter(r => r === 3).length,
+      '2': ratings.filter(r => r === 2).length,
+      '1': ratings.filter(r => r === 1).length
+    };
+
+    res.json({
+      ...profile,
+      stats: {
+        totalAlbumsListened: listens.length,
+        totalMinutesSpended: Math.round(totalMinutes),
+        ratingsDistribution,
+        averageRating: ratings.length > 0
+          ? (ratings.reduce((a, b) => a + b, 0) / ratings.length).toFixed(1)
+          : 0
+      }
+    });
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+// 5️⃣ OBTENER PERFIL DEL USUARIO AUTENTICADO
+app.get('/api/users/:userId', async (req, res) => {
+  const { userId } = req.params;
+
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('id, username, bio')
+      .eq('id', userId)
+      .single();
+
+    if (error && error.code === 'PGRST116') {
+      return res.json({ id: userId, username: '', bio: '' });
+    }
+    if (error) throw error;
+
+    res.json(data);
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+// 6️⃣ ACTUALIZAR PERFIL DEL USUARIO
+app.put('/api/users/:userId', async (req, res) => {
+  const { userId } = req.params;
+  const { username, bio } = req.body;
+
+  // Validaciones
+  if (username && !validateUsername(username)) {
+    return res.status(400).json({
+      error: 'Username inválido. Solo letras, números, _ y -. Entre 3-20 caracteres.'
+    });
+  }
+
+  try {
+    // Verificar que el username no esté en uso
+    if (username) {
+      const { data: existing } = await supabase
+        .from('profiles')
+        .select('id')
+        .ilike('username', username)
+        .not('id', 'eq', userId)
+        .single();
+
+      if (existing) {
+        return res.status(409).json({ error: 'Username ya está en uso' });
+      }
+    }
+
+    const { data, error } = await supabase
+      .from('profiles')
+      .upsert({
+        id: userId,
+        username: username ? username.toLowerCase() : undefined,
+        bio: sanitizeString(bio)
+      }, { onConflict: 'id' })
+      .select();
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      message: 'Perfil actualizado',
+      data: data[0]
+    });
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+// 7️⃣ GENERAR RESUMEN MENSUAL
 app.post('/api/users/:userId/summaries/generate', async (req, res) => {
   const { userId } = req.params;
   const { year, month } = req.body;
 
-  if (!year || !month) {
-    return res.status(400).json({ error: 'Faltan parámetros: year y month son obligatorios' });
+  if (!year || !month || month < 1 || month > 12) {
+    return res.status(400).json({ error: 'year y month (1-12) son obligatorios' });
   }
 
   try {
     const startDate = new Date(year, month - 1, 1).toISOString();
     const endDate = new Date(year, month, 1).toISOString();
 
-    const { data: listens, error: listensError } = await supabase
+    const { data: listens, error } = await supabase
       .from('listens')
-      .select(`
-        album_id,
-        albums (title, artist, duration_ms)
-      `)
+      .select('album_id, albums(title, artist, duration_ms)')
       .eq('user_id', userId)
       .gte('listened_at', startDate)
       .lt('listened_at', endDate);
 
-    if (listensError) throw listensError;
+    if (error) throw error;
 
     if (!listens || listens.length === 0) {
-      return res.status(404).json({ message: 'No se encontraron escuchas para este usuario en el mes seleccionado.' });
+      return res.status(404).json({
+        message: 'No hay escuchas para este mes'
+      });
     }
 
     let totalMs = 0;
     const albumCounts = {};
     const artistCounts = {};
-    const uniqueAlbums = new Map();
 
     listens.forEach(listen => {
       const album = listen.albums;
@@ -206,26 +390,14 @@ app.post('/api/users/:userId/summaries/generate', async (req, res) => {
       totalMs += album.duration_ms;
       albumCounts[listen.album_id] = (albumCounts[listen.album_id] || 0) + 1;
       artistCounts[album.artist] = (artistCounts[album.artist] || 0) + 1;
-
-      if (!uniqueAlbums.has(listen.album_id)) {
-        uniqueAlbums.set(listen.album_id, album.duration_ms);
-      }
     });
 
-    const mostListenedAlbumId = Object.keys(albumCounts).reduce((a, b) => albumCounts[a] > albumCounts[b] ? a : b);
-    const topArtist = Object.keys(artistCounts).reduce((a, b) => artistCounts[a] > artistCounts[b] ? a : b);
-
-    let longestAlbumId = null;
-    let maxDuration = 0;
-    uniqueAlbums.forEach((duration, id) => {
-      if (duration > maxDuration) {
-        maxDuration = duration;
-        longestAlbumId = id;
-      }
-    });
-
-    const totalMinutes = Math.round(totalMs / 1000 / 60);
-    const totalListens = listens.length;
+    const topAlbumId = Object.keys(albumCounts).reduce((a, b) =>
+      albumCounts[a] > albumCounts[b] ? a : b, null
+    );
+    const topArtist = Object.keys(artistCounts).reduce((a, b) =>
+      artistCounts[a] > artistCounts[b] ? a : b, null
+    );
 
     const { data: summary, error: summaryError } = await supabase
       .from('monthly_summaries')
@@ -233,87 +405,86 @@ app.post('/api/users/:userId/summaries/generate', async (req, res) => {
         user_id: userId,
         year,
         month,
-        total_minutes: totalMinutes,
-        total_listens: totalListens,
-        most_listened_album_id: mostListenedAlbumId,
-        longest_album_id: longestAlbumId,
+        total_minutes: Math.round(totalMs / 1000 / 60),
+        total_listens: listens.length,
+        most_listened_album_id: topAlbumId,
         top_artist: topArtist
-      }, { onConflict: 'user_id, year, month' })
+      }, { onConflict: 'user_id,year,month' })
       .select();
 
     if (summaryError) throw summaryError;
 
     res.json({
       success: true,
-      message: `✨ ¡Resumen de tornamesa generado para el mes ${month}/${year}!`,
+      message: `Resumen generado para ${month}/${year}`,
       summary: summary[0]
     });
-
   } catch (error) {
-    console.error('❌ Error al generar resumen:', error.message);
-    res.status(500).json({ error: 'Error interno al procesar el resumen mensual' });
+    handleError(res, error);
   }
 });
 
-// 5. NUEVA RUTA: OBTENER PERFIL ACTUAL DEL USUARIO
-app.get('/api/users/:userId', async (req, res) => {
-  const { userId } = req.params;
-  try {
-    const { data, error } = await supabase
-      .from('profiles')
-      .select('username, bio')
-      .eq('id', userId)
-      .single();
-
-    // Si todavía no tiene perfil creado, devolvemos campos vacíos en vez de error
-    if (error && error.code === 'PGRST116') {
-      return res.json({ username: '', bio: '' });
-    }
-    if (error) throw error;
-
-    res.json(data);
-  } catch (error) {
-    console.error('❌ Error en GET /api/users/:userId:', error.message);
-    res.status(500).json({ error: 'Error al obtener el perfil' });
-  }
-});
-
-// 6. NUEVA RUTA: ACTUALIZAR O CREAR EL PERFIL DEL USUARIO
-app.put('/api/users/:userId', async (req, res) => {
-  const { userId } = req.params;
-  const { username, bio } = req.body;
-
-  try {
-    const { data, error } = await supabase
-      .from('profiles')
-      .upsert({ id: userId, username, bio })
-      .select();
-
-    if (error) throw error;
-
-    res.json({ success: true, message: 'Perfil actualizado con éxito', data });
-  } catch (error) {
-    console.error('❌ Error en PUT /api/users/:userId:', error.message);
-    res.status(500).json({ error: 'Error interno al actualizar el perfil' });
-  }
-});
-
-app.get('/api/profiles/username/:username', async (req, res) => {
+// 8️⃣ OBTENER HISTORIAL PÚBLICO DEL USUARIO (para perfil)
+app.get('/api/profiles/:username/history', async (req, res) => {
   const { username } = req.params;
+  const { limit = 20 } = req.query;
+
   try {
-    const { data, error } = await supabase
+    const { data: profile, error: profileError } = await supabase
       .from('profiles')
-      .select('id, username, bio')
-      .ilike('username', username) // 👈 .ilike ignora mayúsculas y minúsculas
+      .select('id')
+      .ilike('username', username)
       .single();
 
-    if (error) return res.status(404).json({ error: 'Usuario no encontrado' });
-    res.json(data);
+    if (profileError) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    const { data: history, error } = await supabase
+      .from('listens')
+      .select(`
+        id,
+        listened_at,
+        rating,
+        albums (
+          spotify_id,
+          title,
+          artist,
+          cover_url
+        )
+      `)
+      .eq('user_id', profile.id)
+      .order('listened_at', { ascending: false })
+      .limit(limit);
+
+    if (error) throw error;
+
+    res.json(history || []);
   } catch (error) {
-    console.error('❌ Error en GET /api/profiles/username/:username:', error.message);
-    res.status(500).json({ error: 'Error al obtener el perfil' });
+    handleError(res, error);
   }
 });
 
+// ❤️ HEALTH CHECK
+app.get('/health', (req, res) => {
+  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+});
+
+// 404 HANDLER
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint no encontrado' });
+});
+
+// 🚀 START SERVER
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Servidor de tornamesa en puerto ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`
+╔════════════════════════════════════════╗
+║      🎵 TORNAMESA BACKEND             ║
+║      Puerto: ${PORT}                    ║
+║      Env: ${process.env.NODE_ENV || 'development'}          ║
+╚════════════════════════════════════════╝
+  `);
+});
+
+module.exports = app;
